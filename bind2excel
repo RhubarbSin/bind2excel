@@ -1,0 +1,208 @@
+#!/usr/bin/perl
+#
+# bind2excel: write MS Excel spreadsheet from BIND 9 configuration files
+#
+# $Id: bind2excel,v 1.8 2014/07/17 19:15:21 blb Exp $
+# $Source: /Users/blb/git/bind2excel/RCS/bind2excel,v $
+#
+# Assumptions based on local conventions:
+#
+# Each view has only one pair of nameservers--ns1 and ns2.
+# One of the zones in each view has the same name as the view.
+# Each individual config file included by the main config has only one view.
+# Each zone may have a mail server (mail) and web server (www).
+# Multiple MX RRs in a zone point to the same host.
+#
+# This code is messy and unlikely to fail gracefully; the parser is
+# crude and ugly.
+#
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Sys::Hostname;
+use Spreadsheet::WriteExcel;
+
+use constant DEBUG => 1;
+
+my $named_root_dir = "/var/named/chroot";
+my $named_conf_dir = $named_root_dir . "/etc";
+my $named_conf_file = $named_conf_dir . "/named.conf";
+my $named_zone_dir = $named_root_dir . "/var/named";
+
+my $hostname = hostname;
+
+#
+# Get list of included config files from main config.
+#
+my @domain_conf_files;
+
+open(FILE, "<", $named_conf_file) || die "Cannot open $named_conf_file";
+while(<FILE>) {
+  chomp;
+  if (/^include.*\.conf/) {
+    my @line = split /"/;
+    push @domain_conf_files, $named_root_dir . $line[$#line - 1];
+  }
+}
+close(FILE);
+
+#
+# Get list of views, zones, and zone file names from config files.
+#
+my $views;
+
+foreach my $conf_file (@domain_conf_files) {
+  open(FILE, "<", $conf_file) || die "Cannot open $conf_file";
+  my $cur_view;
+  my $cur_zone;
+  while(<FILE>) {
+    chomp;
+    #
+    # Assume only one view per config file.
+    #
+    if (/^\s*view.*\{/) {
+      my @line = split /"/;
+      $cur_view->{'zones'} = ();
+      $views->{$line[1]} = $cur_view;
+    }
+    if (/^\s*zone.*\{/) {
+      next if (/"\."/);
+      my @line = split /"/;
+      $cur_zone = {zone_file_name => ""};
+      $cur_view->{'zones'}->{lc($line[1])} = $cur_zone;
+    }
+    if (/^\s*file/) {
+      next if (/named\.root\.hints/);
+      my @line = split /"/;
+      $cur_zone->{'zone_file_name'} = $named_zone_dir . "/" . $line[1];
+    }
+  }
+  close(FILE);
+}
+
+#print Dumper($views) if DEBUG;
+
+#
+# Get addresses of name servers for each view.
+# Get names and addresses of MX host for each forward zone.
+# Get address of WWW host for each forward zone.
+#
+my $view_name_len = 0;
+my $zone_name_len = 0;
+my $host_name_len = length("Host Name");
+
+foreach my $view_name (sort keys %$views) {
+  print "Reading view " . $view_name . "\n";
+  foreach my $zones ($views->{$view_name}->{'zones'}) {
+    foreach my $zone_name (sort keys %$zones) {
+      if ($zone_name =~ /^[[:alpha:]]/) {
+        print "Reading zone " . $zone_name . "\n";
+        my $zone_file = $zones->{$zone_name}->{'zone_file_name'};
+        open(FILE, "<", $zone_file) || die "Cannot open $zone_file";
+        while(<FILE>) {
+          chomp;
+          s/;.*//;
+          my ($junk, @junk);
+          ($junk, $views->{$view_name}->{'contact_addr'}) = split /\. /
+            if (/IN\s*SOA/);
+          ($junk, $views->{$view_name}->{'ns1_addr'}) = split /A\s*/
+            if (/^ns1[[:blank:]].*A[[:blank:]]/);
+          ($junk, $views->{$view_name}->{'ns2_addr'}) = split /A\s*/
+            if (/^ns2[[:blank:]].*A[[:blank:]]/);
+          if (/^mail.*[[:blank:]]A[[:blank:]]/) {
+            (my $mail_name, @junk) = split /\s/;
+            ($junk, my $mail_addr) = split /A\s*/;
+            $zones->{$zone_name}->{'hosts'}->{$mail_name} = $mail_addr;
+          }
+          if (/^rwhois.*[[:blank:]]A[[:blank:]]/) {
+            (my $rwhois_name, @junk) = split /\s/;
+            ($junk, my $rwhois_addr) = split /A\s*/;
+            $zones->{$zone_name}->{'hosts'}->{$rwhois_name} = $rwhois_addr;
+          }
+          if (/^www.*[[:blank:]]A[[:blank:]]/) {
+            (my $www_name, @junk) = split /\s/;
+            ($junk, my $www_addr) = split /A\s*/;
+            $zones->{$zone_name}->{'hosts'}->{$www_name} = $www_addr;
+          }
+        }
+        $views->{$view_name}->{'contact_addr'} =~ s/\./@/
+          if ($views->{$view_name}->{'contact_addr'});
+        close(FILE);
+      }
+    }
+  }
+  $view_name_len = $view_name_len < length($view_name) ?
+    $view_name_len = length($view_name) : $view_name_len;
+  $host_name_len = $host_name_len < length("ns1." . $view_name) ?
+    length("ns1." . $view_name) : $host_name_len;
+  $zone_name_len = $zone_name_len < length($views->{$view_name}->{'contact_addr'}) ?
+    $zone_name_len = length($views->{$view_name}->{'contact_addr'}) : $zone_name_len;
+}
+
+print "Writing spreadsheet...";
+
+my $output_fn = $hostname . ".xls";
+my $sheet = Spreadsheet::WriteExcel->new($output_fn);
+my $page = $sheet->addworksheet();
+
+my $date_fmt = $sheet->add_format(align => 'center',
+                                  size  => 14);
+my $header_fmt = $sheet->add_format(bold     => 1,
+                                    align    => 'center',
+                                    size     => 14,
+                                    bg_color => 0x18);
+my $view_fmt = $sheet->add_format(bg_color => 0x16);
+my $zone_fmt = $sheet->add_format(bg_color => 0x1F);
+
+use constant VIEW_COL => 0;
+use constant ZONE_COL => 1;
+use constant HOST_COL => 2;
+use constant IP_COL   => 3;
+
+$page->set_row(0, 16, $date_fmt);
+$page->set_row(2, 16, $header_fmt);
+$page->set_column(VIEW_COL, VIEW_COL, $view_name_len);
+$page->set_column(ZONE_COL, ZONE_COL, $zone_name_len);
+$page->set_column(HOST_COL, HOST_COL, $host_name_len);
+$page->set_column(IP_COL,   IP_COL,   15);
+
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+$year += 1900;
+$mon++;
+$page->write(0, 0, "$year-$mon-$mday", $date_fmt);
+
+my $row = 2;
+my @header_row = ("View", "Zone", "Host Name", "IP Address");
+$page->write_row($row++, VIEW_COL, \@header_row, $header_fmt);
+
+foreach my $view_name (sort keys %$views) {
+  $page->write($row, VIEW_COL, $view_name, $view_fmt);
+  $page->write($row, ZONE_COL, $views->{$view_name}->{'contact_addr'}, $view_fmt);
+  $page->write($row, HOST_COL, "ns1.$view_name", $view_fmt);
+  $page->write($row++, IP_COL, $views->{$view_name}->{'ns1_addr'}, $view_fmt);
+  $page->write($row, HOST_COL, "ns2.$view_name", $view_fmt);
+  $page->write($row++, IP_COL, $views->{$view_name}->{'ns2_addr'}, $view_fmt);
+  my $zones = $views->{$view_name}->{'zones'};
+  foreach my $zone_name (sort keys %$zones) {
+    if ($zone_name =~ /^[[:alpha:]]/) {
+      my $add_row = 1;
+      $page->write($row, ZONE_COL, $zone_name, $zone_fmt);
+      my $hosts = $zones->{$zone_name}->{'hosts'};
+      foreach my $host_name (sort keys %$hosts) {
+        $page->write($row, HOST_COL, $host_name, $zone_fmt);
+        $page->write($row++, IP_COL, $hosts->{$host_name}, $zone_fmt);
+        $add_row = 0;
+      }
+      $row++ if ($add_row);
+    }
+  }
+  foreach my $zone_name (sort keys %$zones) {
+    $page->write($row++, ZONE_COL, $zone_name, $zone_fmt)
+      if ($zone_name =~ /^[[:digit:]]/);
+  }
+}
+
+print "wrote $output_fn.\n";
+
+exit 0;
