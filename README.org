@@ -1,6 +1,6 @@
 #+TITLE: BIND2Excel
 
-*You probably won't like and won't want what you may find here.*
+*You probably won't like or want what you may find here.*
 
 This Perl code parses BIND 9 configuration files and zone files and writes a corresponding file in Microsoft Excel format. It was intended to be a small /ad hoc/ endeavor to simplify the conveyance of basic, frequently changing DNS information to management. It worked because most of the BIND configuration had been programmatically generated and followed a fairly consistent format. It doesn't support IPv6 addresses and probably isn't easily adaptable to other formatting conventions because...well, just /look/ at it. It did meet the requirements, but I'm not sure it was the simplest thing that could possibly work.
 
